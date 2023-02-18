@@ -21,7 +21,7 @@ import (
 	"net"
 
 	"github.com/containernetworking/cni/pkg/types"
-	types100 "github.com/containernetworking/cni/pkg/types/100"
+	current "github.com/containernetworking/cni/pkg/types/100"
 )
 
 type IPConfig struct {
@@ -48,11 +48,11 @@ type Result struct {
 	Interfaces map[string]*Config
 	DNS        []types.DNS
 	Routes     []*types.Route
-	raw        []*types100.Result
+	raw        []*current.Result
 }
 
 // Raw returns the raw CNI results of multiple networks.
-func (r *Result) Raw() []*types100.Result {
+func (r *Result) Raw() []*current.Result {
 	return r.raw
 }
 
@@ -66,7 +66,7 @@ type Config struct {
 // structured data containing the interface configuration for each of the
 // interfaces created in the namespace. It returns an error if validation of
 // results fails, or if a network could not be found.
-func (c *libcni) createResult(results []*types100.Result) (*Result, error) {
+func (c *libcni) createResult(results []*current.Result) (*Result, error) {
 	c.RLock()
 	defer c.RUnlock()
 	r := &Result{
@@ -110,8 +110,8 @@ func (c *libcni) createResult(results []*types100.Result) (*Result, error) {
 // getInterfaceName returns the interface name if the plugins
 // return the result with associated interfaces. If interface
 // is not present then default interface name is used
-func (c *libcni) getInterfaceName(interfaces []*types100.Interface,
-	ipConf *types100.IPConfig) string {
+func (c *libcni) getInterfaceName(interfaces []*current.Interface,
+	ipConf *current.IPConfig) string {
 	if ipConf.Interface != nil {
 		return interfaces[*ipConf.Interface].Name
 	}

@@ -27,6 +27,8 @@ var (
 	ErrRead              = errors.New("failed to read config file")
 	ErrInvalidResult     = errors.New("invalid result")
 	ErrLoad              = errors.New("failed to load cni config")
+	ErrAlreadyExists     = errors.New("already exists")
+	ErrResourceBusy      = errors.New("resource is busy")
 )
 
 // IsCNINotInitialized returns true if the error is due to cni config not being initialized
@@ -52,4 +54,9 @@ func IsReadFailure(err error) bool {
 // IsInvalidResult return true if the error is due to invalid cni result
 func IsInvalidResult(err error) bool {
 	return errors.Is(err, ErrInvalidResult)
+}
+
+// IsAlreadyExists returns true if the error is due to already existing entity
+func IsAlreadyExists(err error) bool {
+	return errors.Is(err, ErrAlreadyExists)
 }

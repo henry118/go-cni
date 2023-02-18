@@ -94,11 +94,7 @@ func WithLoNetwork(c *libcni) error {
 }]
 }`))
 
-	c.networks = append(c.networks, &Network{
-		cni:    c.cniConfig,
-		config: loConfig,
-		ifName: "lo",
-	})
+	c.networks = append(c.networks, newNetwork(c.cniConfig, loConfig, "lo"))
 	return nil
 }
 
@@ -120,11 +116,7 @@ func WithConfIndex(bytes []byte, index int) Opt {
 		if err != nil {
 			return err
 		}
-		c.networks = append(c.networks, &Network{
-			cni:    c.cniConfig,
-			config: confList,
-			ifName: getIfName(c.prefix, index),
-		})
+		c.networks = append(c.networks, newNetwork(c.cniConfig, confList, getIfName(c.prefix, index)))
 		return nil
 	}
 }
@@ -143,11 +135,7 @@ func WithConfFile(fileName string) Opt {
 		if err != nil {
 			return err
 		}
-		c.networks = append(c.networks, &Network{
-			cni:    c.cniConfig,
-			config: confList,
-			ifName: getIfName(c.prefix, 0),
-		})
+		c.networks = append(c.networks, newNetwork(c.cniConfig, confList, getIfName(c.prefix, 0)))
 		return nil
 	}
 }
@@ -161,11 +149,7 @@ func WithConfListBytes(bytes []byte) Opt {
 			return err
 		}
 		i := len(c.networks)
-		c.networks = append(c.networks, &Network{
-			cni:    c.cniConfig,
-			config: confList,
-			ifName: getIfName(c.prefix, i),
-		})
+		c.networks = append(c.networks, newNetwork(c.cniConfig, confList, getIfName(c.prefix, i)))
 		return nil
 	}
 }
@@ -180,11 +164,7 @@ func WithConfListFile(fileName string) Opt {
 			return err
 		}
 		i := len(c.networks)
-		c.networks = append(c.networks, &Network{
-			cni:    c.cniConfig,
-			config: confList,
-			ifName: getIfName(c.prefix, i),
-		})
+		c.networks = append(c.networks, newNetwork(c.cniConfig, confList, getIfName(c.prefix, i)))
 		return nil
 	}
 }
@@ -227,7 +207,7 @@ func loadFromConfDir(c *libcni, max int) error {
 	// interface provided during init as the network interface for this default
 	// network. For every other network use a generated interface id.
 	i := 0
-	var networks []*Network
+	var networks []*network
 	for _, confFile := range files {
 		var confList *cnilibrary.NetworkConfigList
 		if strings.HasSuffix(confFile, ".conflist") {
@@ -255,11 +235,7 @@ func loadFromConfDir(c *libcni, max int) error {
 			return fmt.Errorf("CNI config list in config file %s has no networks, skipping: %w", confFile, ErrInvalidConfig)
 
 		}
-		networks = append(networks, &Network{
-			cni:    c.cniConfig,
-			config: confList,
-			ifName: getIfName(c.prefix, i),
-		})
+		networks = append(networks, newNetwork(c.cniConfig, confList, getIfName(c.prefix, i)))
 		i++
 		if i == max {
 			break

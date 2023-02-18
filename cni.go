@@ -18,15 +18,18 @@ package cni
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
 	cnilibrary "github.com/containernetworking/cni/libcni"
 	"github.com/containernetworking/cni/pkg/invoke"
 	"github.com/containernetworking/cni/pkg/types"
-	types100 "github.com/containernetworking/cni/pkg/types/100"
+	current "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/cni/pkg/version"
 )
 
@@ -45,6 +48,47 @@ type CNI interface {
 	Status() error
 	// GetConfig returns a copy of the CNI plugin configurations as parsed by CNI
 	GetConfig() *ConfigResult
+	// CreateNetwork creates and adds a network config
+	CreateNetwork(cfg []byte, ifName string) (Network, error)
+	// DeleteNetwork deletes a network config
+	DeleteNetwork(name string) error
+	// Network returns a network config identified by name
+	GetNetwork(name string) (Network, error)
+	// ListNetworks returns all networks
+	ListNetworks() []Network
+	// ListAttachments returns attachments for the specified container
+	// In case of empty id, all attachments will be returned
+	ListAttachments(id string) []Attachment
+	// GetResult returns the cached result of namespace setups
+	// This routine can be used to retrieve the updated result
+	// after networks are dynamically attached/detached
+	GetResult(id string) (*Result, error)
+}
+
+// Network defines the interfaces of a Network definition.
+type Network interface {
+	// Name returns the name of the network
+	Name() string
+	// Config returns the network config
+	Config() *ConfNetwork
+	// Attach the network to a container
+	Attach(ctx context.Context, id string, path string, opts ...NamespaceOpts) (Attachment, error)
+}
+
+// Attachment is the operation of applying a network configuration to a container
+type Attachment interface {
+	// Network returns the name of the network that this attachment is created for
+	Network() string
+	// Container returns the id of the container
+	Container() string
+	// IfName returns the interface name within the container
+	IfName() string
+	// NetNS returns the path of network namespace
+	NetNS() string
+	// Remove the attachment
+	Remove(ctx context.Context) error
+	// Check whether the current status of the attachment is as expected
+	Check(ctx context.Context) error
 }
 
 type ConfigResult struct {
@@ -79,7 +123,7 @@ type libcni struct {
 
 	cniConfig    cnilibrary.CNI
 	networkCount int // minimum network plugin configurations needed to initialize cni
-	networks     []*Network
+	networks     []*network
 	sync.RWMutex
 }
 
@@ -145,10 +189,14 @@ func (c *libcni) Status() error {
 
 // Networks returns all the configured networks.
 // NOTE: Caller MUST NOT modify anything in the returned array.
-func (c *libcni) Networks() []*Network {
+func (c *libcni) ListNetworks() []Network {
 	c.RLock()
 	defer c.RUnlock()
-	return append([]*Network{}, c.networks...)
+	var rs []Network
+	for _, n := range c.networks {
+		rs = append(rs, n)
+	}
+	return rs
 }
 
 // Setup setups the network in the namespace and returns a Result
@@ -183,10 +231,11 @@ func (c *libcni) SetupSerially(ctx context.Context, id string, path string, opts
 	return c.createResult(result)
 }
 
-func (c *libcni) attachNetworksSerially(ctx context.Context, ns *Namespace) ([]*types100.Result, error) {
-	var results []*types100.Result
-	for _, network := range c.Networks() {
-		r, err := network.Attach(ctx, ns)
+func (c *libcni) attachNetworksSerially(ctx context.Context, ns *Namespace) ([]*current.Result, error) {
+	var results []*current.Result
+	for _, net := range c.ListNetworks() {
+		network := net.(*network)
+		r, err := network.attach(ctx, ns)
 		if err != nil {
 			return nil, err
 		}
@@ -197,28 +246,30 @@ func (c *libcni) attachNetworksSerially(ctx context.Context, ns *Namespace) ([]*
 
 type asynchAttachResult struct {
 	index int
-	res   *types100.Result
+	res   *current.Result
 	err   error
 }
 
-func asynchAttach(ctx context.Context, index int, n *Network, ns *Namespace, wg *sync.WaitGroup, rc chan asynchAttachResult) {
+func asynchAttach(ctx context.Context, index int, n *network, ns *Namespace, wg *sync.WaitGroup, rc chan asynchAttachResult) {
 	defer wg.Done()
-	r, err := n.Attach(ctx, ns)
+	r, err := n.attach(ctx, ns)
 	rc <- asynchAttachResult{index: index, res: r, err: err}
 }
 
-func (c *libcni) attachNetworks(ctx context.Context, ns *Namespace) ([]*types100.Result, error) {
+func (c *libcni) attachNetworks(ctx context.Context, ns *Namespace) ([]*current.Result, error) {
 	var wg sync.WaitGroup
 	var firstError error
-	results := make([]*types100.Result, len(c.Networks()))
+	networks := c.ListNetworks()
+	results := make([]*current.Result, len(networks))
 	rc := make(chan asynchAttachResult)
 
-	for i, network := range c.Networks() {
+	for i, net := range networks {
+		network := net.(*network)
 		wg.Add(1)
 		go asynchAttach(ctx, i, network, ns, &wg, rc)
 	}
 
-	for range c.Networks() {
+	for range networks {
 		rs := <-rc
 		if rs.err != nil && firstError == nil {
 			firstError = rs.err
@@ -239,8 +290,10 @@ func (c *libcni) Remove(ctx context.Context, id string, path string, opts ...Nam
 	if err != nil {
 		return err
 	}
-	for _, network := range c.Networks() {
-		if err := network.Remove(ctx, ns); err != nil {
+	// TODO Consider using cached attachments because network list may be updated already
+	for _, net := range c.ListNetworks() {
+		network := net.(*network)
+		if err := network.detach(ctx, ns); err != nil {
 			// Based on CNI spec v0.7.0, empty network namespace is allowed to
 			// do best effort cleanup. However, it is not handled consistently
 			// right now:
@@ -267,8 +320,10 @@ func (c *libcni) Check(ctx context.Context, id string, path string, opts ...Name
 	if err != nil {
 		return err
 	}
-	for _, network := range c.Networks() {
-		err := network.Check(ctx, ns)
+	// TODO Consider using cached attachments because network list may be updated already
+	for _, net := range c.ListNetworks() {
+		network := net.(*network)
+		err := network.check(ctx, ns)
 		if err != nil {
 			return err
 		}
@@ -288,25 +343,169 @@ func (c *libcni) GetConfig() *ConfigResult {
 		Prefix:           c.config.prefix,
 	}
 	for _, network := range c.networks {
-		conf := &NetworkConfList{
-			Name:       network.config.Name,
-			CNIVersion: network.config.CNIVersion,
-			Source:     string(network.config.Bytes),
-		}
-		for _, plugin := range network.config.Plugins {
-			conf.Plugins = append(conf.Plugins, &NetworkConf{
-				Network: plugin.Network,
-				Source:  string(plugin.Bytes),
-			})
-		}
-		r.Networks = append(r.Networks, &ConfNetwork{
-			Config: conf,
-			IFName: network.ifName,
-		})
+		r.Networks = append(r.Networks, network.Config())
 	}
 	return r
 }
 
 func (c *libcni) reset() {
 	c.networks = nil
+}
+
+func (c *libcni) CreateNetwork(cfg []byte, ifName string) (Network, error) {
+	conflist, err := cnilibrary.ConfListFromBytes(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse conflist, %w", ErrInvalidConfig)
+	}
+	c.Lock()
+	defer c.Unlock()
+	for _, n := range c.networks {
+		if n.Name() == conflist.Name {
+			return nil, fmt.Errorf("network %q already exists, %w", n.Name(), ErrAlreadyExists)
+		}
+		if n.ifName == ifName {
+			return nil, fmt.Errorf("network %q already has interface %q, %w", n.Name(), ifName, ErrAlreadyExists)
+		}
+	}
+	n := newNetwork(c.cniConfig, conflist, ifName)
+	c.networks = append(c.networks, n)
+	return n, nil
+}
+
+func (c *libcni) DeleteNetwork(name string) error {
+	c.Lock()
+	defer c.Unlock()
+	i := len(c.networks)
+	for k, n := range c.networks {
+		if n.Name() == name {
+			i = k
+			break
+		}
+	}
+	if i == len(c.networks) {
+		return fmt.Errorf("network %q does not exist, %w", name, ErrNotFound)
+	}
+	c.networks = append(c.networks[:i], c.networks[i+1:]...)
+	return nil
+}
+
+func (c *libcni) GetNetwork(name string) (Network, error) {
+	c.RLock()
+	defer c.RUnlock()
+	for _, n := range c.networks {
+		if n.Name() == name {
+			return n, nil
+		}
+	}
+	return nil, fmt.Errorf("network %q does not exist, %w", name, ErrNotFound)
+}
+
+func (c *libcni) ListAttachments(id string) []Attachment {
+	var rs []Attachment
+	list, err := getCachedAttachments(id)
+	if err != nil {
+		return rs
+	}
+	for _, i := range list {
+		rs = append(rs, newAttachment(i, c.cniConfig, nil))
+	}
+	return rs
+}
+
+func (c *libcni) GetResult(id string) (*Result, error) {
+	list, err := getCachedAttachments(id)
+	if err != nil {
+		return nil, err
+	}
+	var rs []*current.Result
+	for _, i := range list {
+		cfg, err := cnilibrary.ConfListFromBytes(i.Config)
+		if err != nil {
+			return nil, err
+		}
+		rt := &cnilibrary.RuntimeConf{
+			ContainerID:    i.ContainerID,
+			NetNS:          i.NetNS,
+			IfName:         i.IfName,
+			Args:           i.CniArgs,
+			CapabilityArgs: i.CapabilityArgs,
+		}
+		r, err := c.cniConfig.GetNetworkListCachedResult(cfg, rt)
+		if err != nil {
+			return nil, err
+		}
+		cr, err := current.NewResultFromResult(r)
+		if err != nil {
+			return nil, err
+		}
+		rs = append(rs, cr)
+	}
+	return c.createResult(rs)
+}
+
+// The following will be added to CNI
+func getCachedAttachments(containerID string) ([]*NetworkAttachment, error) {
+	dirPath := filepath.Join(cnilibrary.CacheDir, "results")
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return nil, err
+	}
+
+	fileNames := make([]string, 0, len(entries))
+	for _, e := range entries {
+		fileNames = append(fileNames, e.Name())
+	}
+	sort.Strings(fileNames)
+
+	attachments := []*NetworkAttachment{}
+	for _, fname := range fileNames {
+		if len(containerID) > 0 {
+			part := fmt.Sprintf("-%s-", containerID)
+			pos := strings.Index(fname, part)
+			if pos <= 0 || pos+len(part) >= len(fname) {
+				continue
+			}
+		}
+
+		cacheFile := filepath.Join(dirPath, fname)
+		bytes, err := os.ReadFile(cacheFile)
+		if err != nil {
+			continue
+		}
+
+		cachedInfo := struct {
+			Kind           string                 `json:"kind"`
+			Config         []byte                 `json:"config"`
+			IfName         string                 `json:"ifName"`
+			ContainerID    string                 `json:"containerID"`
+			NetworkName    string                 `json:"networkName"`
+			NetNS          string                 `json:"netns,omitempty"`
+			CniArgs        [][2]string            `json:"cniArgs,omitempty"`
+			CapabilityArgs map[string]interface{} `json:"capabilityArgs,omitempty"`
+		}{}
+
+		if err := json.Unmarshal(bytes, &cachedInfo); err != nil {
+			continue
+		}
+		if cachedInfo.Kind != cnilibrary.CNICacheV1 {
+			continue
+		}
+		if len(containerID) > 0 && cachedInfo.ContainerID != containerID {
+			continue
+		}
+		if cachedInfo.IfName == "" || cachedInfo.NetworkName == "" {
+			continue
+		}
+
+		attachments = append(attachments, &NetworkAttachment{
+			ContainerID:    cachedInfo.ContainerID,
+			Network:        cachedInfo.NetworkName,
+			IfName:         cachedInfo.IfName,
+			Config:         cachedInfo.Config,
+			NetNS:          cachedInfo.NetNS,
+			CniArgs:        cachedInfo.CniArgs,
+			CapabilityArgs: cachedInfo.CapabilityArgs,
+		})
+	}
+	return attachments, nil
 }

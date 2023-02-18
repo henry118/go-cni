@@ -20,29 +20,160 @@ import (
 	"context"
 
 	cnilibrary "github.com/containernetworking/cni/libcni"
-	types100 "github.com/containernetworking/cni/pkg/types/100"
+	current "github.com/containernetworking/cni/pkg/types/100"
 )
 
-type Network struct {
+type network struct {
 	cni    cnilibrary.CNI
 	config *cnilibrary.NetworkConfigList
 	ifName string
 }
 
-func (n *Network) Attach(ctx context.Context, ns *Namespace) (*types100.Result, error) {
-	r, err := n.cni.AddNetworkList(ctx, n.config, ns.config(n.ifName))
+var _ Network = (*network)(nil)
+
+func newNetwork(cni cnilibrary.CNI, conflist *cnilibrary.NetworkConfigList, ifName string) *network {
+	return &network{
+		cni:    cni,
+		config: conflist,
+		ifName: ifName,
+	}
+}
+
+func (n *network) Name() string {
+	return n.config.Name
+}
+
+func (n *network) Config() *ConfNetwork {
+	conf := &NetworkConfList{
+		Name:       n.config.Name,
+		CNIVersion: n.config.CNIVersion,
+		Source:     string(n.config.Bytes),
+	}
+	for _, plugin := range n.config.Plugins {
+		conf.Plugins = append(conf.Plugins, &NetworkConf{
+			Network: plugin.Network,
+			Source:  string(plugin.Bytes),
+		})
+	}
+	return &ConfNetwork{
+		Config: conf,
+		IFName: n.ifName,
+	}
+}
+
+func (n *network) Attach(ctx context.Context, id string, path string, opts ...NamespaceOpts) (Attachment, error) {
+	ns, err := newNamespace(id, path, opts...)
 	if err != nil {
 		return nil, err
 	}
-	return types100.NewResultFromResult(r)
+	rt := ns.config(n.ifName)
+	cr, err := n.attach(ctx, ns)
+	if err != nil {
+		return nil, err
+	}
+	return newAttachment(&NetworkAttachment{
+		ContainerID:    rt.ContainerID,
+		Network:        n.Name(),
+		IfName:         rt.IfName,
+		Config:         n.config.Bytes,
+		NetNS:          rt.NetNS,
+		CniArgs:        rt.Args,
+		CapabilityArgs: rt.CapabilityArgs,
+	}, n.cni, cr), nil
 }
 
-func (n *Network) Remove(ctx context.Context, ns *Namespace) error {
+func (n *network) attach(ctx context.Context, ns *Namespace) (*current.Result, error) {
+	rt := ns.config(n.ifName)
+	r, err := n.cni.AddNetworkList(ctx, n.config, rt)
+	if err != nil {
+		return nil, err
+	}
+	cr, err := current.NewResultFromResult(r)
+	if err != nil {
+		return nil, err
+	}
+	return cr, nil
+}
+
+func (n *network) detach(ctx context.Context, ns *Namespace) error {
 	return n.cni.DelNetworkList(ctx, n.config, ns.config(n.ifName))
 }
 
-func (n *Network) Check(ctx context.Context, ns *Namespace) error {
+func (n *network) check(ctx context.Context, ns *Namespace) error {
 	return n.cni.CheckNetworkList(ctx, n.config, ns.config(n.ifName))
+}
+
+// TODO the following will be in the upcoming CNI release
+type NetworkAttachment struct {
+	ContainerID    string
+	Network        string
+	IfName         string
+	Config         []byte
+	NetNS          string
+	CniArgs        [][2]string
+	CapabilityArgs map[string]interface{}
+}
+
+type attachment struct {
+	NetworkAttachment
+	cni    cnilibrary.CNI
+	result *current.Result
+}
+
+var _ Attachment = (*attachment)(nil)
+
+func newAttachment(info *NetworkAttachment, cni cnilibrary.CNI, result *current.Result) *attachment {
+	return &attachment{
+		NetworkAttachment: *info,
+		cni:               cni,
+		result:            result,
+	}
+}
+
+func (a *attachment) Network() string {
+	return a.NetworkAttachment.Network
+}
+
+func (a *attachment) Container() string {
+	return a.NetworkAttachment.ContainerID
+}
+
+func (a *attachment) IfName() string {
+	return a.NetworkAttachment.IfName
+}
+
+func (a *attachment) NetNS() string {
+	return a.NetworkAttachment.NetNS
+}
+
+func (a *attachment) Remove(ctx context.Context) error {
+	rt := &cnilibrary.RuntimeConf{
+		ContainerID:    a.Container(),
+		NetNS:          a.NetNS(),
+		IfName:         a.IfName(),
+		Args:           a.CniArgs,
+		CapabilityArgs: a.CapabilityArgs,
+	}
+	conflist, err := cnilibrary.ConfListFromBytes(a.Config)
+	if err != nil {
+		return err
+	}
+	return a.cni.DelNetworkList(ctx, conflist, rt)
+}
+
+func (a *attachment) Check(ctx context.Context) error {
+	rt := &cnilibrary.RuntimeConf{
+		ContainerID:    a.Container(),
+		NetNS:          a.NetNS(),
+		IfName:         a.IfName(),
+		Args:           a.CniArgs,
+		CapabilityArgs: a.CapabilityArgs,
+	}
+	conflist, err := cnilibrary.ConfListFromBytes(a.Config)
+	if err != nil {
+		return err
+	}
+	return a.cni.CheckNetworkList(ctx, conflist, rt)
 }
 
 type Namespace struct {
